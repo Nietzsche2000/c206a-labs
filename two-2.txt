@@ -1,0 +1,263 @@
+Nice—ckpt 2 is the “multi-turtle via a service + teleport” bit. Below is a minimal, working setup that:
+
+* Extends the `Patrol.srv` to include turtle name **and** pose.
+* Switches the server to a generic `/turtle_patrol` service (not hard-coded to turtle1).
+* Teleports the requested turtle, then continuously streams `cmd_vel` to **each** requested turtle (supports many at once).
+* Provides a CLI client: `ros2 run turtle_patrol patrol_client <name> <x> <y> <theta> <vel> <omega>`.
+  This matches the ckpt text. 
+
+---
+
+# 1) Service definition (`turtle_patrol_interface/srv/Patrol.srv`)
+
+```srv
+string turtle_name
+float32 x
+float32 y
+float32 theta
+float32 vel
+float32 omega
+---
+geometry_msgs/Twist cmd
+```
+
+Rebuild the interface package after editing:
+
+```bash
+colcon build --packages-select turtle_patrol_interface
+source install/setup.bash
+```
+
+---
+
+# 2) Server node (`turtle_patrol/patrol_server.py`)
+
+```python
+import rclpy
+from rclpy.node import Node
+from geometry_msgs.msg import Twist
+from turtlesim.srv import TeleportAbsolute
+from turtle_patrol_interface.srv import Patrol
+
+class TurtlePatrolServer(Node):
+    def __init__(self):
+        super().__init__('turtle_patrol_server')
+
+        # One generic service for all turtles
+        self._srv = self.create_service(Patrol, '/turtle_patrol', self.patrol_cb)
+
+        # Cache: per-turtle publishers and current commanded speeds
+        self._pubs = {}     # name -> Publisher
+        self._speeds = {}   # name -> (lin, ang)
+
+        # Timer: publish all current turtle commands at 10 Hz
+        self._timer = self.create_timer(0.1, self._publish_all)
+
+        self.get_logger().info('TurtlePatrolServer ready: /turtle_patrol')
+
+    # Ensure we have a publisher for this turtle
+    def _ensure_pub(self, name: str):
+        if name not in self._pubs:
+            topic = f'/{name}/cmd_vel'
+            self._pubs[name] = self.create_publisher(Twist, topic, 10)
+            self.get_logger().info(f'Created publisher for {name}: {topic}')
+
+    # Publish latest speeds for all turtles we’ve seen
+    def _publish_all(self):
+        for name, (lin, ang) in self._speeds.items():
+            msg = Twist()
+            msg.linear.x = lin
+            msg.angular.z = ang
+            self._pubs[name].publish(msg)
+
+    # Teleport a turtle immediately
+    def _teleport(self, name: str, x: float, y: float, theta: float):
+        cli = self.create_client(TeleportAbsolute, f'/{name}/teleport_absolute')
+        if not cli.wait_for_service(timeout_sec=2.0):
+            self.get_logger().warn(f'teleport service for {name} not available.')
+            return False
+        req = TeleportAbsolute.Request()
+        req.x = x
+        req.y = y
+        req.theta = theta
+        fut = cli.call_async(req)
+        rclpy.spin_until_future_complete(self, fut)
+        ok = fut.result() is not None
+        if ok:
+            self.get_logger().info(f'Teleported {name} to x={x:.2f}, y={y:.2f}, th={theta:.2f}')
+        else:
+            self.get_logger().error(f'Failed to teleport {name}')
+        return ok
+
+    # Service callback
+    def patrol_cb(self, request: Patrol.Request, response: Patrol.Response):
+        name = request.turtle_name.strip() or 'turtle1'
+        self.get_logger().info(
+            f"Patrol req -> name={name}, pose=({request.x:.2f},{request.y:.2f},{request.theta:.2f}), "
+            f"vel={request.vel:.2f}, omega={request.omega:.2f}"
+        )
+
+        # Prepare publisher + teleport
+        self._ensure_pub(name)
+        self._teleport(name, request.x, request.y, request.theta)
+
+        # Remember current command for this turtle (published by timer)
+        self._speeds[name] = (float(request.vel), float(request.omega))
+
+        # Response mirrors the commanded twist
+        cmd = Twist()
+        cmd.linear.x = float(request.vel)
+        cmd.angular.z = float(request.omega)
+        response.cmd = cmd
+
+        self.get_logger().info(f"Streaming {name}: lin.x={cmd.linear.x:.2f}, ang.z={cmd.angular.z:.2f} @10Hz")
+        return response
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = TurtlePatrolServer()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    node.destroy_node()
+    rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
+```
+
+---
+
+# 3) Client node (`turtle_patrol/patrol_client.py`)
+
+```python
+import sys
+import rclpy
+from rclpy.node import Node
+from turtle_patrol_interface.srv import Patrol
+
+USAGE = "usage: ros2 run turtle_patrol patrol_client <name> <x> <y> <theta> <vel> <omega>"
+
+class TurtlePatrolClient(Node):
+    def __init__(self, args):
+        super().__init__('turtle_patrol_client')
+
+        if len(args) != 7:
+            raise SystemExit(USAGE)
+
+        name, x, y, th, v, w = args
+        x, y, th, v, w = map(float, (x, y, th, v, w))
+
+        self._service = '/turtle_patrol'
+        self._client = self.create_client(Patrol, self._service)
+
+        self.get_logger().info(f"Waiting for service {self._service} ...")
+        while not self._client.wait_for_service(timeout_sec=1.0):
+            self.get_logger().info(f"{self._service} not available, waiting...")
+
+        req = Patrol.Request()
+        req.turtle_name = name
+        req.x = x
+        req.y = y
+        req.theta = th
+        req.vel = v
+        req.omega = w
+
+        self.get_logger().info(
+            f"Requesting patrol for {name}: pose=({x:.2f},{y:.2f},{th:.2f}), vel={v:.2f}, omega={w:.2f}"
+        )
+        self._future = self._client.call_async(req)
+
+def main(argv=None):
+    rclpy.init(args=argv)
+    node = TurtlePatrolClient(sys.argv[1:])
+    rclpy.spin_until_future_complete(node, node._future)
+
+    if node._future.done():
+        res = node._future.result()
+        if res:
+            cmd = res.cmd
+            node.get_logger().info(
+                f"Service OK. Twist: lin.x={cmd.linear.x:.2f}, ang.z={cmd.angular.z:.2f}"
+            )
+        else:
+            node.get_logger().error("Service call failed (no result).")
+    else:
+        node.get_logger().error("Service call did not complete.")
+
+    node.destroy_node()
+    rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
+```
+
+---
+
+# 4) Entry points (so `ros2 run` works)
+
+In `turtle_patrol/setup.cfg` (or `setup.py`), ensure:
+
+```ini
+[options.entry_points]
+console_scripts =
+    patrol_server = turtle_patrol.patrol_server:main
+    patrol_client = turtle_patrol.patrol_client:main
+```
+
+Then rebuild:
+
+```bash
+colcon build --packages-select turtle_patrol turtle_patrol_interface
+source install/setup.bash
+```
+
+---
+
+# 5) How to run / demo checklist
+
+1. Start turtlesim:
+
+```bash
+ros2 run turtlesim turtlesim_node
+```
+
+2. (Optional) Spawn more turtles:
+
+```bash
+ros2 service call /spawn turtlesim/srv/Spawn "{x: 2.0, y: 2.0, theta: 0.0, name: 'alpha'}"
+ros2 service call /spawn turtlesim/srv/Spawn "{x: 8.0, y: 8.0, theta: 0.0, name: 'bravo'}"
+```
+
+3. Start the server (single instance controls *all* turtles):
+
+```bash
+ros2 run turtle_patrol patrol_server
+```
+
+4. Call via the client (teleport + start patrolling):
+
+```bash
+# turtle1
+ros2 run turtle_patrol patrol_client turtle1 5.0 5.0 0.0 2.0 1.0
+
+# alpha
+ros2 run turtle_patrol patrol_client alpha 3.0 7.0 0.5 1.5 0.8
+
+# bravo
+ros2 run turtle_patrol patrol_client bravo 8.0 3.0 -0.7 2.5 1.2
+```
+
+You should see **multiple turtles** patrolling in circles from the commanded initial poses. This demonstrates: a) how services differ from subscriber callbacks (on-demand vs continuous), and b) why the architecture works (one server, many cached publishers, timer continuously streams commands to all requested turtles). 
+
+---
+
+# 6) Common gotchas
+
+* Make sure the service name matches on both sides: server `/turtle_patrol`, client `/turtle_patrol`.
+* If you see “service not available,” confirm you sourced the right overlay: `source install/setup.bash`.
+* If build errors mention entry points, re-check `setup.cfg` and package naming.
+* If an individual turtle doesn’t move, confirm the publisher topic (e.g., `ros2 topic echo /alpha/cmd_vel`) and that the turtle actually exists (`ros2 service call /spawn ...`).
+
+If you paste this in place of your current files and rebuild, you’re good for checkoff.
